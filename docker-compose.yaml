@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  milvus-standalone:
+    image: milvusdb/milvus:v2.4.1-latest
+    container_name: milvus-standalone
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - ./volumes/milvus:/var/lib/milvus
+    environment:
+      - ETCD_USE_EMBED=true
+      - ETCD_DATA_DIR=/var/lib/milvus/etcd
+      - COMMON_STORAGETYPE=local
+
+  app:
+    build: .
+    container_name: research-agent-app
+    ports:
+      - "7860:7860"
+    depends_on:
+      - milvus-standalone
+    environment:
+      - MILVUS_HOST=milvus-standalone
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    volumes:
+      - .:/app # Mount current directory for easy development
+    command: >
+      sh -c "
+      echo 'Waiting for Milvus to be healthy...' &&
+      while ! wget -q -O- http://milvus-standalone:9091/healthz; do
+        sleep 1;
+      done;
+      echo 'Milvus is healthy. Starting ingestion and app...' &&
+      python ingest.py &&
+      gradio app.py --server_name 0.0.0.0
+      "
+
+volumes:
+  milvus:
