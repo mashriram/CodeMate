@@ -3,13 +3,14 @@ import markdown
 from weasyprint import HTML
 import os
 import uuid
+from langchain_core.messages import HumanMessage
 
 from agent import research_agent
 import config
 from data_handler import process_and_embed_pdfs
 
 
-# --- Helper Functions (No changes) ---
+# --- Helper & File Upload Functions (No changes) ---
 def generate_exports(markdown_report: str):
     md_path = "research_report.md"
     with open(md_path, "w", encoding="utf-8") as f:
@@ -20,120 +21,86 @@ def generate_exports(markdown_report: str):
     return md_path, pdf_path
 
 
-# --- File Upload Handler (No changes) ---
 def handle_file_upload(files):
     if not files:
-        return "No files uploaded. Please select one or more PDF files."
-
-    file_paths = []
-    for file in files:
-        # This logic correctly handles Gradio's temporary file objects
-        content = ""
-        with open(file.name, "rb") as f:
-            content = f.read()
-
-        filepath = os.path.join(config.DATA_DIRECTORY, os.path.basename(file.name))
-        with open(filepath, "wb") as f:
-            f.write(content)
-        file_paths.append(filepath)
-
+        return "No files uploaded."
+    file_paths = [file.name for file in files]
     try:
         docs_processed, chunks_ingested = process_and_embed_pdfs(file_paths)
-        return f"✅ Successfully processed {docs_processed} file(s) and ingested {chunks_ingested} new chunks into the knowledge base."
+        return f"✅ Successfully processed {docs_processed} file(s) and ingested {chunks_ingested} new chunks."
     except Exception as e:
         return f"❌ Error during file processing: {e}"
 
 
-# --- Multi-Stage Agent Logic (CORRECTED) ---
-def run_planning_phase(query: str, chat_history: list):
+# --- Agent Interaction Logic (REBUILT FOR STABILITY) ---
+def start_new_research(query: str, chat_history: list):
+    """PHASE 1: Plan the research."""
     chat_history.append({"role": "user", "content": query})
+    thread_id = str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Update UI immediately to show the agent is working
     yield (
         chat_history,
         "*Generating research plan...*",
-        None,
+        thread_id,
         None,
         gr.update(interactive=False),
         gr.update(visible=False),
     )
 
-    try:
-        thread_id = str(uuid.uuid4())
-        config = {"configurable": {"thread_id": thread_id}}
+    # Run the planning phase
+    result = research_agent.invoke(
+        {"task": query, "execute_research": False}, config=config
+    )
+    plan = result["plan"]
+    plan_markdown = "### Research Plan\n" + "\n".join(f"1. {step}" for step in plan)
 
-        # Invoke the agent to run the planning step.
-        research_agent.invoke({"task": query, "execute_research": False}, config=config)
-
-        # THE FIX: Explicitly get the final state for the thread.
-        final_state = research_agent.get_state(config)
-        plan = final_state.values["plan"]
-
-        plan_markdown = "### Research Plan\n" + "\n".join(f"1. {step}" for step in plan)
-
-        yield (
-            chat_history,
-            plan_markdown,
-            thread_id,
-            plan,
-            gr.update(interactive=False),
-            gr.update(visible=True, interactive=True),
-        )
-    except Exception as e:
-        yield (
-            chat_history,
-            f"Error during planning: {e}",
-            None,
-            None,
-            gr.update(interactive=True),
-            gr.update(visible=False),
-        )
-
-
-def run_execution_phase(thread_id: str, plan: list, chat_history: list):
+    # Final update for this phase
     yield (
         chat_history,
-        "Executing plan... (Researching, Drafting, Revising)",
+        plan_markdown,
+        thread_id,
+        plan,
+        gr.update(interactive=False),
+        gr.update(visible=True, interactive=True),
+    )
+
+
+def execute_research(thread_id: str, plan: list, chat_history: list):
+    """PHASE 2: Execute the plan and generate the report."""
+    config = {"configurable": {"thread_id": thread_id}}
+
+    # Update UI immediately
+    yield (
+        chat_history,
+        "Executing plan... This may take a moment.",
         gr.update(visible=False),
         gr.update(visible=False),
         gr.update(interactive=False),
+        gr.update(visible=False, interactive=False),
+    )
+
+    # Run the execution phase
+    final_state = research_agent.invoke({"execute_research": True}, config=config)
+
+    final_report = final_state["revised_draft"]
+    reasoning_log = "\n".join(f"- {step}" for step in final_state["reasoning_log"])
+    chat_history.append({"role": "assistant", "content": final_report})
+    md_path, pdf_path = generate_exports(final_report)
+
+    # Final update for the entire process
+    yield (
+        chat_history,
+        reasoning_log,
+        gr.update(value=md_path, visible=True),
+        gr.update(value=pdf_path, visible=True),
+        gr.update(interactive=True),  # Re-enable start button
         gr.update(visible=False),
     )
 
-    try:
-        config = {"configurable": {"thread_id": thread_id}}
 
-        # Invoke the agent to resume and run the execution steps.
-        research_agent.invoke({"execute_research": True}, config=config)
-
-        # THE FIX: Explicitly get the final state for the thread.
-        final_state = research_agent.get_state(config)
-        final_report = final_state.values["revised_draft"]
-
-        chat_history.append({"role": "assistant", "content": final_report})
-        md_path, pdf_path = generate_exports(final_report)
-
-        yield (
-            chat_history,
-            "Execution complete. Final report below.",
-            gr.update(value=md_path, visible=True),
-            gr.update(value=pdf_path, visible=True),
-            gr.update(interactive=True),
-            gr.update(visible=False),
-        )
-    except Exception as e:
-        error_message = f"Error during execution: {e}"
-        chat_history.append({"role": "assistant", "content": error_message})
-        yield (
-            chat_history,
-            error_message,
-            gr.update(visible=False),
-            gr.update(visible=False),
-            gr.update(interactive=True),
-            gr.update(visible=False),
-        )
-        raise e
-
-
-# --- Gradio UI Definition (No changes) ---
+# --- Gradio UI Definition ---
 with gr.Blocks(theme=gr.themes.Soft(), title=config.APP_TITLE) as demo:
     plan_state = gr.State()
     thread_id_state = gr.State()
@@ -146,24 +113,25 @@ with gr.Blocks(theme=gr.themes.Soft(), title=config.APP_TITLE) as demo:
             )
             query_box = gr.Textbox(label="Enter your research query:", container=False)
             with gr.Row():
-                plan_button = gr.Button("Plan Research", variant="primary")
+                plan_button = gr.Button("Start Research", variant="primary")
                 execute_button = gr.Button(
                     "Execute Plan", variant="primary", visible=False, interactive=False
                 )
+
         with gr.Column(scale=1):
             gr.Markdown("### Add to Knowledge Base")
             upload_button = gr.UploadButton(
                 "Upload PDFs", file_types=[".pdf"], file_count="multiple"
             )
             upload_status = gr.Markdown("*Upload status...*")
-            gr.Markdown("### Agent Plan & Reasoning")
+            gr.Markdown("### Agent Reasoning Steps")
             reasoning_display = gr.Markdown("*Agent is idle...*")
             gr.Markdown("### Export Results")
             download_md = gr.File(label="Download Markdown", visible=False)
             download_pdf = gr.File(label="Download PDF", visible=False)
 
     plan_button.click(
-        fn=run_planning_phase,
+        fn=start_new_research,
         inputs=[query_box, chatbot],
         outputs=[
             chatbot,
@@ -176,7 +144,7 @@ with gr.Blocks(theme=gr.themes.Soft(), title=config.APP_TITLE) as demo:
     )
 
     execute_button.click(
-        fn=run_execution_phase,
+        fn=execute_research,
         inputs=[thread_id_state, plan_state, chatbot],
         outputs=[
             chatbot,

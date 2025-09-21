@@ -1,41 +1,83 @@
-version: '3.8'
-
 services:
-  milvus-standalone:
-    image: milvusdb/milvus:v2.4.1-latest
-    container_name: milvus-standalone
-    ports:
-      - "19530:19530"
-      - "9091:9091"
-    volumes:
-      - ./volumes/milvus:/var/lib/milvus
+  etcd:
+    container_name: milvus-etcd-mate
+    image: quay.io/coreos/etcd:v3.5.5
     environment:
-      - ETCD_USE_EMBED=true
-      - ETCD_DATA_DIR=/var/lib/milvus/etcd
-      - COMMON_STORAGETYPE=local
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/etcd:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
 
+  minio:
+    container_name: milvus-minio-mate
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9002:9001"  # Changed from 9001 to 9002
+      - "9003:9000"  # Changed from 9000 to 9003
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/minio:/minio_data
+    command: minio server /minio_data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  standalone:
+    container_name: milvus-standalone-mate
+    image: milvusdb/milvus:v2.6.2
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+    - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/milvus:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+    ports:
+      - "19531:19530"  # Changed from 19530 to 19531
+      - "9092:9091"    # Changed from 9091 to 9092
+    depends_on:
+      - "etcd"
+      - "minio"
+
+  # Your Research Agent Application
   app:
     build: .
     container_name: research-agent-app
     ports:
       - "7860:7860"
     depends_on:
-      - milvus-standalone
+      standalone:
+        condition: service_healthy
     environment:
-      - MILVUS_HOST=milvus-standalone
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MILVUS_HOST=standalone
+      - MILVUS_PORT=19530  # Internal port remains 19530
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      # Debug environment variables
+      - DEBUG=1
+    restart: unless-stopped
     volumes:
-      - .:/app # Mount current directory for easy development
-    command: >
-      sh -c "
-      echo 'Waiting for Milvus to be healthy...' &&
-      while ! wget -q -O- http://milvus-standalone:9091/healthz; do
-        sleep 1;
-      done;
-      echo 'Milvus is healthy. Starting ingestion and app...' &&
-      python ingest.py &&
-      gradio app.py --server_name 0.0.0.0
-      "
+      # Mount data directory for PDF uploads
+      - ./data:/app/data
 
-volumes:
-  milvus:
+networks:
+  default:
+    name: milvus-mate  # Changed network name to avoid conflicts

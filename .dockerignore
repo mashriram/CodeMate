@@ -1,0 +1,45 @@
+# Ignore Milvus volume directories
+volumes/
+volumes/etcd/
+volumes/minio/
+volumes/milvus/
+
+# Ignore Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+
+# Ignore IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore OS files
+.DS_Store
+Thumbs.db
+
+# Ignore git
+.git/
+.gitignore
+
+# Ignore Docker files (don't need them inside container)
+docker-compose.yml
+Dockerfile*
+
+# Ignore logs and temporary files
+*.log
+tmp/
+temp/
+
+# Ignore any test or development files
+test_*.py
+*_test.py
+tests/
