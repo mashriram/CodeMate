@@ -2,19 +2,15 @@ import gradio as gr
 import markdown
 from weasyprint import HTML
 import os
-import time
+import uuid
 
-from agent import get_deep_research_agent
+from agent import research_agent
 import config
 from data_handler import process_and_embed_pdfs
 
-# --- Agent Initialization ---
-agent_executor = get_deep_research_agent()
 
-
-# --- Helper Functions ---
+# --- Helper Functions (No changes) ---
 def generate_exports(markdown_report: str):
-    """Generates and saves Markdown and PDF files."""
     md_path = "research_report.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(markdown_report)
@@ -24,106 +20,172 @@ def generate_exports(markdown_report: str):
     return md_path, pdf_path
 
 
+# --- File Upload Handler (No changes) ---
 def handle_file_upload(files):
-    """Handles the upload and processing of new PDF files."""
     if not files:
-        return "No files uploaded."
-    file_paths = [file.name for file in files]
+        return "No files uploaded. Please select one or more PDF files."
+
+    file_paths = []
+    for file in files:
+        # This logic correctly handles Gradio's temporary file objects
+        content = ""
+        with open(file.name, "rb") as f:
+            content = f.read()
+
+        filepath = os.path.join(config.DATA_DIRECTORY, os.path.basename(file.name))
+        with open(filepath, "wb") as f:
+            f.write(content)
+        file_paths.append(filepath)
+
     try:
         docs_processed, chunks_ingested = process_and_embed_pdfs(file_paths)
-        return f"✅ Successfully processed {docs_processed} file(s) and ingested {chunks_ingested} new chunks."
+        return f"✅ Successfully processed {docs_processed} file(s) and ingested {chunks_ingested} new chunks into the knowledge base."
     except Exception as e:
         return f"❌ Error during file processing: {e}"
 
 
-# --- Main Application Logic (Corrected) ---
-def run_research_agent(query: str, chat_history: list):
-    """
-    Invokes the deep agent to run to completion and returns the final result.
-    """
-    # Let the user know the agent has started
+# --- Multi-Stage Agent Logic (CORRECTED) ---
+def run_planning_phase(query: str, chat_history: list):
+    chat_history.append({"role": "user", "content": query})
     yield (
         chat_history,
-        "*Agent is planning and researching...*",
-        gr.update(visible=False),
+        "*Generating research plan...*",
+        None,
+        None,
+        gr.update(interactive=False),
         gr.update(visible=False),
     )
 
-    # deepagents expects this specific input format
-    inputs = {"messages": [{"role": "user", "content": query}]}
+    try:
+        thread_id = str(uuid.uuid4())
+        config = {"configurable": {"thread_id": thread_id}}
 
-    # Use .invoke() to run the agent until it finishes
-    final_state = agent_executor.invoke(inputs)
+        # Invoke the agent to run the planning step.
+        research_agent.invoke({"task": query, "execute_research": False}, config=config)
 
-    # Extract the final report from the last AI message
-    final_report = final_state["messages"][-1].content
-    chat_history.append({"role": "assistant", "content": final_report})
+        # THE FIX: Explicitly get the final state for the thread.
+        final_state = research_agent.get_state(config)
+        plan = final_state.values["plan"]
 
-    # Extract the reasoning from the agent's internal scratchpad file
-    reasoning = final_state.get("files", {}).get(
-        "research_findings.md", "Agent did not produce a findings file."
-    )
-    reasoning_text = f"**Agent's Research Notes:**\n\n---\n\n{reasoning}"
+        plan_markdown = "### Research Plan\n" + "\n".join(f"1. {step}" for step in plan)
 
-    # Generate export files from the final report
-    md_path, pdf_path = generate_exports(final_report)
+        yield (
+            chat_history,
+            plan_markdown,
+            thread_id,
+            plan,
+            gr.update(interactive=False),
+            gr.update(visible=True, interactive=True),
+        )
+    except Exception as e:
+        yield (
+            chat_history,
+            f"Error during planning: {e}",
+            None,
+            None,
+            gr.update(interactive=True),
+            gr.update(visible=False),
+        )
 
-    # Yield the final, complete result to the UI
+
+def run_execution_phase(thread_id: str, plan: list, chat_history: list):
     yield (
         chat_history,
-        reasoning_text,
-        gr.update(value=md_path, visible=True),
-        gr.update(value=pdf_path, visible=True),
+        "Executing plan... (Researching, Drafting, Revising)",
+        gr.update(visible=False),
+        gr.update(visible=False),
+        gr.update(interactive=False),
+        gr.update(visible=False),
     )
 
+    try:
+        config = {"configurable": {"thread_id": thread_id}}
 
-# --- Gradio UI Definition (Corrected) ---
+        # Invoke the agent to resume and run the execution steps.
+        research_agent.invoke({"execute_research": True}, config=config)
+
+        # THE FIX: Explicitly get the final state for the thread.
+        final_state = research_agent.get_state(config)
+        final_report = final_state.values["revised_draft"]
+
+        chat_history.append({"role": "assistant", "content": final_report})
+        md_path, pdf_path = generate_exports(final_report)
+
+        yield (
+            chat_history,
+            "Execution complete. Final report below.",
+            gr.update(value=md_path, visible=True),
+            gr.update(value=pdf_path, visible=True),
+            gr.update(interactive=True),
+            gr.update(visible=False),
+        )
+    except Exception as e:
+        error_message = f"Error during execution: {e}"
+        chat_history.append({"role": "assistant", "content": error_message})
+        yield (
+            chat_history,
+            error_message,
+            gr.update(visible=False),
+            gr.update(visible=False),
+            gr.update(interactive=True),
+            gr.update(visible=False),
+        )
+        raise e
+
+
+# --- Gradio UI Definition (No changes) ---
 with gr.Blocks(theme=gr.themes.Soft(), title=config.APP_TITLE) as demo:
-    gr.Markdown(f"# {config.APP_TITLE}")
+    plan_state = gr.State()
+    thread_id_state = gr.State()
 
+    gr.Markdown(f"# {config.APP_TITLE}")
     with gr.Row():
         with gr.Column(scale=2):
             chatbot = gr.Chatbot(
                 label="Research Assistant", height=600, type="messages"
             )
-            query_box = gr.Textbox(
-                label="Enter your research query:",
-                container=False,
-                placeholder="e.g., What are the key differences between LangGraph and CrewAI?",
-            )
-            submit_btn = gr.Button("Start Research", variant="primary")
-
+            query_box = gr.Textbox(label="Enter your research query:", container=False)
+            with gr.Row():
+                plan_button = gr.Button("Plan Research", variant="primary")
+                execute_button = gr.Button(
+                    "Execute Plan", variant="primary", visible=False, interactive=False
+                )
         with gr.Column(scale=1):
             gr.Markdown("### Add to Knowledge Base")
             upload_button = gr.UploadButton(
-                "Click to Upload PDFs", file_types=[".pdf"], file_count="multiple"
+                "Upload PDFs", file_types=[".pdf"], file_count="multiple"
             )
-            upload_status = gr.Markdown(value="*Upload status will appear here*")
-            gr.Markdown("### Agent Reasoning")
-            reasoning_display = gr.Markdown(value="*Agent is idle...*")
+            upload_status = gr.Markdown("*Upload status...*")
+            gr.Markdown("### Agent Plan & Reasoning")
+            reasoning_display = gr.Markdown("*Agent is idle...*")
             gr.Markdown("### Export Results")
             download_md = gr.File(label="Download Markdown", visible=False)
             download_pdf = gr.File(label="Download PDF", visible=False)
 
-    def on_submit(query, history):
-        """
-        This function ONLY updates the UI with the user's message.
-        The actual agent call is handled in the .then() block.
-        This prevents the duplicate message bug.
-        """
-        history.append({"role": "user", "content": query})
-        return "", history  # Clear textbox, return updated history
+    plan_button.click(
+        fn=run_planning_phase,
+        inputs=[query_box, chatbot],
+        outputs=[
+            chatbot,
+            reasoning_display,
+            thread_id_state,
+            plan_state,
+            plan_button,
+            execute_button,
+        ],
+    )
 
-    # The .then() event ensures that run_research_agent is called *after*
-    # the UI has been updated with the user's message.
-    submit_btn.click(
-        fn=on_submit,
-        inputs=[query_box, chatbot],
-        outputs=[query_box, chatbot],
-    ).then(
-        fn=run_research_agent,
-        inputs=[query_box, chatbot],
-        outputs=[chatbot, reasoning_display, download_md, download_pdf],
+    execute_button.click(
+        fn=run_execution_phase,
+        inputs=[thread_id_state, plan_state, chatbot],
+        outputs=[
+            chatbot,
+            reasoning_display,
+            download_md,
+            download_pdf,
+            plan_button,
+            execute_button,
+        ],
     )
 
     upload_button.upload(
