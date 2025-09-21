@@ -61,7 +61,7 @@ pip install uv
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
+git clone (https://github.com/mashriram/CodeMate)
 cd CodeMate
 
 # Initialize UV project
